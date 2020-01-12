@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+f"Python version >= 3.6 required!"
+# ^^^ fstrings are valid since python 3.6, will syntax error otherwise
+
 BANNER = r"""
     .___.__  .__            __               __
   __| _/|  | |__| ____     |__| ____   _____/  |_  ______ ___.__.
@@ -12,11 +15,15 @@ source: https://github.com/DavidBuchanan314/dlinject
 """
 
 import argparse
-from elftools.elf.elffile import ELFFile
-from pwn import *
-context.arch = "amd64"
+import os
+import re
+import signal
+import time
+import subprocess
 
-STACK_BACKUP_SIZE = 8*16
+from elftools.elf.elffile import ELFFile
+
+STACK_BACKUP_SIZE = 8 * 16
 STAGE2_SIZE = 0x8000
 
 
@@ -32,6 +39,46 @@ def lookup_elf_symbol(elf_name, sym_name):
 		return syms[0].entry.st_value
 
 
+def ansi_color(name):
+	color_codes = {
+		"blue": 34,
+		"red": 91,
+		"green": 32,
+		"default": 39,
+	}
+	return f"\x1b[{color_codes[name]}m"
+
+
+def log(msg, color="blue", symbol="*"):
+	print(f"[{ansi_color(color)}{symbol}{ansi_color('default')}] {msg}")
+
+
+def log_success(msg):
+	log(msg, "green", "+")
+
+
+def log_error(msg):
+	log(msg, "red", "!")
+	raise Exception(msg)
+
+
+def assemble(source):
+	cmd = "gcc -x assembler - -o /dev/stdout -nostdlib -Wl,--oformat=binary -m64"
+	argv = cmd.split(" ")
+	prefix = b".intel_syntax noprefix\n.globl _start\n_start:\n"
+
+	program = prefix + source.encode()
+	pipe = subprocess.PIPE
+
+	result = subprocess.run(argv, stdout=pipe, stderr=pipe, input=program)
+
+	if result.returncode != 0:
+		emsg = result.stderr.decode().strip()
+		log_error("Assembler command failed:\n\t" + emsg.replace("\n", "\n\t"))
+
+	return result.stdout
+
+
 def dlinject(pid, lib_path, stopmethod="sigstop"):
 	with open(f"/proc/{pid}/maps") as maps_file:
 		for line in maps_file.readlines():
@@ -40,40 +87,40 @@ def dlinject(pid, lib_path, stopmethod="sigstop"):
 				ld_base = int(line.split("-")[0], 16)
 				break
 		else:
-			log.error("Couldn't find ld.so! (we need it for _dl_open)")
+			log_error("Couldn't find ld.so! (we need it for _dl_open)")
 
-	log.info("ld.so found: " + repr(ld_path))
-	log.info("ld.so base: " + hex(ld_base))
+	log("ld.so found: " + repr(ld_path))
+	log("ld.so base: " + hex(ld_base))
 	dl_open_offset = lookup_elf_symbol(ld_path, "_dl_open")
 
 	if not dl_open_offset:
-		log.error("Unable to locate _dl_open symbol")
+		log_error("Unable to locate _dl_open symbol")
 
 	dl_open_addr = ld_base + dl_open_offset
-	log.info("_dl_open: " + hex(dl_open_addr))
+	log("_dl_open: " + hex(dl_open_addr))
 
 	if stopmethod == "sigstop":
-		log.info("Sending SIGSTOP")
+		log("Sending SIGSTOP")
 		os.kill(pid, signal.SIGSTOP)
 		while True:
 			with open(f"/proc/{pid}/stat") as stat_file:
 				state = stat_file.read().split(" ")[2]
 			if state in ["T", "t"]:
 				break
-			log.info("Waiting for process to stop...")
+			log("Waiting for process to stop...")
 			time.sleep(0.1)
 	elif stopmethod == "cgroup_freeze":
 		freeze_dir = "/sys/fs/cgroup/freezer/dlinject_" + os.urandom(8).hex()
 		os.mkdir(freeze_dir)
-		with open(freeze_dir+"/tasks", "w") as task_file:
+		with open(freeze_dir + "/tasks", "w") as task_file:
 			task_file.write(str(pid))
-		with open(freeze_dir+"/freezer.state", "w") as state_file:
+		with open(freeze_dir + "/freezer.state", "w") as state_file:
 			state_file.write("FROZEN\n")
 		while True:
-			with open(freeze_dir+"/freezer.state") as state_file:
+			with open(freeze_dir + "/freezer.state") as state_file:
 				if state_file.read().strip() == "FROZEN":
 					break
-			log.info("Waiting for process to freeze...")
+			log("Waiting for process to freeze...")
 			time.sleep(0.1)
 	else:
 		log.warn("We're not going to stop the process first!")
@@ -83,12 +130,12 @@ def dlinject(pid, lib_path, stopmethod="sigstop"):
 	rip = int(syscall_vals[-1][2:], 16)
 	rsp = int(syscall_vals[-2][2:], 16)
 
-	log.info(f"RIP: {hex(rip)}")
-	log.info(f"RSP: {hex(rsp)}")
+	log(f"RIP: {hex(rip)}")
+	log(f"RSP: {hex(rsp)}")
 
 	stage2_path = f"/tmp/stage2_{os.urandom(8).hex()}.bin"
 
-	shellcode = asm(fr"""
+	shellcode = assemble(fr"""
 		// push all the things
 		pushf
 		push rax
@@ -149,16 +196,16 @@ def dlinject(pid, lib_path, stopmethod="sigstop"):
 		code_backup = mem.read(len(shellcode))
 
 		# back up the part of the stack that the shellcode will clobber
-		mem.seek(rsp-STACK_BACKUP_SIZE)
+		mem.seek(rsp - STACK_BACKUP_SIZE)
 		stack_backup = mem.read(STACK_BACKUP_SIZE)
 
 		# write the primary shellcode
 		mem.seek(rip)
 		mem.write(shellcode)
 
-	log.info("Wrote first stage shellcode")
+	log("Wrote first stage shellcode")
 
-	stage2 = asm(fr"""
+	stage2 = assemble(fr"""
 		cld
 
 		fxsave moar_regs[rip]
@@ -204,10 +251,10 @@ def dlinject(pid, lib_path, stopmethod="sigstop"):
 
 		lea rsp, new_stack_base[rip-{STACK_BACKUP_SIZE}]
 
-		// call _dl_open (https://github.com/lattera/glibc/blob/895ef79e04a953cac1493863bcae29ad85657ee1/elf/dl-open.c#L529)
+		// call _dl_open (glibc/elf/dl-open.c)
 		lea rdi, lib_path[rip]  # file
 		mov rsi, 2              # mode (RTLD_NOW)
-		xor rcx, rcx            # nsid (LM_ID_BASE) (could maybe use LM_ID_NEWLM (-1))
+		xor rcx, rcx            # nsid (LM_ID_BASE) (could maybe use LM_ID_NEWLM)
 		mov rax, {dl_open_addr}
 		call rax
 
@@ -261,24 +308,25 @@ def dlinject(pid, lib_path, stopmethod="sigstop"):
 		os.chmod(stage2_path, 0o666)
 		stage2_file.write(stage2)
 
-	log.info(f"Wrote stage2 to {repr(stage2_path)}")
+	log(f"Wrote stage2 to {repr(stage2_path)}")
 
 	if stopmethod == "sigstop":
-		log.info("Continuing process...")
+		log("Continuing process...")
 		os.kill(pid, signal.SIGCONT)
 	elif stopmethod == "cgroup_freeze":
-		log.info("Thawing process...")
-		with open(freeze_dir+"/freezer.state", "w") as state_file:
+		log("Thawing process...")
+		with open(freeze_dir + "/freezer.state", "w") as state_file:
 			state_file.write("THAWED\n")
-		
+
 		# put the task back in the root cgroup
 		with open("/sys/fs/cgroup/freezer/tasks", "w") as task_file:
 			task_file.write(str(pid))
-		
+
 		# cleanup
 		os.rmdir(freeze_dir)
 
-	log.success("Done!")
+	log_success("Done!")
+
 
 if __name__ == "__main__":
 	print(BANNER)
@@ -286,7 +334,7 @@ if __name__ == "__main__":
 	parser = argparse.ArgumentParser(
 		description="Inject a shared library into a live process.")
 
-	parser.add_argument("pid", metavar="pid", type=int, 
+	parser.add_argument("pid", metavar="pid", type=int,
 		help="The pid of the target process")
 
 	parser.add_argument("lib_path", metavar="/path/to/lib.so", type=str,
@@ -295,7 +343,7 @@ if __name__ == "__main__":
 	parser.add_argument("--stopmethod",
 		choices=["sigstop", "cgroup_freeze", "none"],
 		help="How to stop the target process prior to shellcode injection. \
-		      SIGSTOP (default) can have side-effects. cgroup freeze requires root. \
+		      SIGSTOP (default) can have side-effects. cgroup freeze requires root.\
 		      'none' is likely to cause race conditions.")
 
 	args = parser.parse_args()
